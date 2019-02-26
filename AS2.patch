@@ -1,0 +1,232 @@
+diff -Nur gem5-master/src/mem/cache/replacement_policies/ReplacementPolicies.py gem5/src/mem/cache/replacement_policies/ReplacementPolicies.py
+--- gem5-master/src/mem/cache/replacement_policies/ReplacementPolicies.py	2019-02-23 11:09:02.699128902 -0800
++++ gem5/src/mem/cache/replacement_policies/ReplacementPolicies.py	2019-02-23 11:08:42.103129856 -0800
+@@ -79,10 +79,16 @@
+     cxx_class = 'BRRIPRP'
+     cxx_header = "mem/cache/replacement_policies/brrip_rp.hh"
+     max_RRPV = Param.Int(3, "Maximum RRPV possible")
+-    hit_priority = Param.Bool(False,
++    hit_priority = Param.Bool(True,
+         "Prioritize evicting blocks that havent had a hit recently")
+     btp = Param.Percent(3,
+         "Percentage of blocks to be inserted with long RRPV")
++        
++class SHiPRP(BRRIPRP):
++	type = 'SHiPRP'
++	cxx_class = 'SHiPRP'
++	cxx_header = "mem/cache/replacement_policies/ship_rp.hh"
++	btp = 0
+ 
+ class RRIPRP(BRRIPRP):
+ 	btp = 0
+diff -Nur gem5-master/src/mem/cache/replacement_policies/SConscript gem5/src/mem/cache/replacement_policies/SConscript
+--- gem5-master/src/mem/cache/replacement_policies/SConscript	2019-02-23 11:09:02.699128902 -0800
++++ gem5/src/mem/cache/replacement_policies/SConscript	2019-02-19 16:31:03.449033000 -0800
+@@ -34,6 +34,7 @@
+ 
+ Source('bip_rp.cc')
+ Source('brrip_rp.cc')
++Source('ship_rp.cc')
+ Source('fifo_rp.cc')
+ Source('lfu_rp.cc')
+ Source('lru_rp.cc')
+diff -Nur gem5-master/src/mem/cache/replacement_policies/ship_rp.cc gem5/src/mem/cache/replacement_policies/ship_rp.cc
+--- gem5-master/src/mem/cache/replacement_policies/ship_rp.cc	1969-12-31 16:00:00.000000000 -0800
++++ gem5/src/mem/cache/replacement_policies/ship_rp.cc	2019-02-23 07:53:57.938391378 -0800
+@@ -0,0 +1,97 @@
++/**
++ * Authors: Ming Yi
++ */
++
++#include "mem/cache/replacement_policies/ship_rp.hh"
++
++#include <cassert>
++#include <memory>
++
++#include "base/logging.hh" // For fatal_if
++#include "params/SHiPRP.hh"
++
++vector<int> SHCT(16 * 1024, 0);
++
++long long addr_hash(long long addr) {
++	addr &= 0x000FFFFFFFFFFFFF; // keep the valid physical address which is 52bits 
++	addr >>= 14; //mapping every 16kB region to a signature
++	addr ^= (addr >> 14) ^ (addr >> 28); // XOR hash method: addr[27:14] XOR addr[41:28] XOR addr[51:42]
++	addr &= 0x0000000000003FFF; // identify 16kB unique entries
++	
++	return addr;
++}
++
++SHiPRP::SHiPRP(const Params *p)
++    : BRRIPRP(p)
++{
++}
++
++void
++SHiPRP::invalidate(const std::shared_ptr<ReplacementData>& replacement_data)
++const
++{
++	// Set RRPV to an invalid distance and outcome to false
++    BRRIPRP::invalidate(replacement_data);
++  
++    std::static_pointer_cast<SHiPReplData>(
++        replacement_data)->outcome = false;
++}
++
++void
++SHiPRP::touch(const std::shared_ptr<ReplacementData>& replacement_data) const
++{
++    BRRIPRP::touch(replacement_data);
++    std::static_pointer_cast<SHiPReplData>(
++        replacement_data)->outcome = true;
++	long long sig = addr_hash(replacement_data->_tag);
++	if (SHCT[sig] < 7) {
++		SHCT[sig]++;
++	}
++	
++}
++
++void
++SHiPRP::reset(const std::shared_ptr<ReplacementData>& replacement_data) const
++{  
++    std::shared_ptr<SHiPReplData> casted_replacement_data =
++        std::static_pointer_cast<SHiPReplData>(replacement_data);
++
++//     Reset RRPV
++//     Replacement data is inserted as "intermediate re-reference" if SHCT entry equals zero,
++//     "distant re-reference" otherwise
++    long long sig = addr_hash(replacement_data->_tag);
++    if (SHCT[sig] == 0) {
++        casted_replacement_data->rrpv = maxRRPV;
++    } else {
++        casted_replacement_data->rrpv = 0;
++    }
++}
++
++ReplaceableEntry*
++SHiPRP::getVictim(const ReplacementCandidates& candidates) const
++{
++	ReplaceableEntry* victim = BRRIPRP::getVictim(candidates);
++	
++	std::shared_ptr<SHiPReplData> casted_replacement_data =
++	std::static_pointer_cast<SHiPReplData>(victim->replacementData);
++	if (!casted_replacement_data->outcome && casted_replacement_data->rrpv != (maxRRPV + 1)) {
++		long long sig = addr_hash(casted_replacement_data->_tag);
++	    if (SHCT[sig] > 0) {
++	    	SHCT[sig]--;
++	    }
++	}
++    
++    return victim;
++}
++
++std::shared_ptr<ReplacementData>
++SHiPRP::instantiateEntry()
++{
++    return std::shared_ptr<ReplacementData>(new SHiPReplData(maxRRPV));
++}
++
++SHiPRP*
++SHiPRPParams::create()
++{
++    return new SHiPRP(this);
++}
+diff -Nur gem5-master/src/mem/cache/replacement_policies/ship_rp.hh gem5/src/mem/cache/replacement_policies/ship_rp.hh
+--- gem5-master/src/mem/cache/replacement_policies/ship_rp.hh	1969-12-31 16:00:00.000000000 -0800
++++ gem5/src/mem/cache/replacement_policies/ship_rp.hh	2019-02-21 11:00:03.706790403 -0800
+@@ -0,0 +1,95 @@
++/**
++ * Authors: Ming Yi
++ */
++
++/**
++ * @file
++ * Declaration of a Signature-based Hit Predictor(SHiP) replacement policy.
++ * This implementation uses memory region signatures(SHiP-Mem) with 16K entries, each of which is 3bits.
++ */
++
++#ifndef __MEM_CACHE_REPLACEMENT_POLICIES_SHiP_RP_HH__
++#define __MEM_CACHE_REPLACEMENT_POLICIES_SHiP_RP_HH__
++
++#include "mem/cache/replacement_policies/base.hh"
++#include "mem/cache/replacement_policies/brrip_rp.hh"
++#include <vector>
++
++using namespace std;
++
++struct SHiPRPParams;
++
++class SHiPRP : public BRRIPRP
++{
++  protected:
++    /** SHiP-specific implementation of replacement data. */
++    struct SHiPReplData : BRRIPReplData
++    {
++        /**
++         * Outcome Value.
++         * The outcome bit (initially set to zero) is set to one only if the cache line is re-referenced.
++         */
++        bool outcome;
++
++        /**
++         * Default constructor. Invalidate data.
++         */
++        SHiPReplData(const int max_RRPV) : BRRIPReplData(max_RRPV), outcome(false) {}
++    };
++  
++  public:
++    /** Convenience typedef. */
++    typedef SHiPRPParams Params;
++
++    /**
++     * Construct and initiliaze this replacement policy.
++     */
++    SHiPRP(const Params *p);
++
++    /**
++     * Destructor.
++     */
++    ~SHiPRP() {}
++
++    /**
++     * Invalidate replacement data to set it as the next probable victim.
++     * Set RRPV as the the most distant re-reference.
++     *
++     * @param replacement_data Replacement data to be invalidated.
++     */
++    void invalidate(const std::shared_ptr<ReplacementData>& replacement_data)
++                                                              const override;
++
++    /**
++     * Touch an entry to update its replacement data.
++     *
++     * @param replacement_data Replacement data to be touched.
++     */
++    void touch(const std::shared_ptr<ReplacementData>& replacement_data) const override;
++
++    /**
++     * Reset replacement data. Used when an entry is inserted.
++     * Set RRPV according to the insertion policy used.
++     *
++     * @param replacement_data Replacement data to be reset.
++     */
++    void reset(const std::shared_ptr<ReplacementData>& replacement_data) const
++                                                                     override;
++
++    /**
++     * Find replacement victim using rrpv.
++     *
++     * @param cands Replacement candidates, selected by indexing policy.
++     * @return Replacement entry to be replaced.
++     */
++    ReplaceableEntry* getVictim(const ReplacementCandidates& candidates) const override;
++
++    /**
++     * Instantiate a replacement data entry.
++     *
++     * @return A shared pointer to the new replacement data.
++     */
++    std::shared_ptr<ReplacementData> instantiateEntry() override;
++};
++
++#endif // __MEM_CACHE_REPLACEMENT_POLICIES_SHiP_RP_HH__
